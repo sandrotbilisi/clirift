@@ -56,8 +56,9 @@ export class NodeServer {
       selfHello,
     });
 
-    this.tlsServer.on('peerHandshaked', (socketId, nodeId, _pubkeyPem) => {
+    this.tlsServer.on('peerHandshaked', (socketId, nodeId, pubkeyPem) => {
       logger.info(`[NodeServer] Inbound peer handshaked: ${nodeId} (socket=${socketId})`);
+      this.emitPeerIdentified(nodeId, pubkeyPem);
     });
 
     this.tlsServer.on('peerDisconnected', (socketId, nodeId) => {
@@ -76,8 +77,9 @@ export class NodeServer {
     const peers = parsePeerList(config.CLIRFT_PEERS.join(','));
     this.peerManager = new PeerManager(selfHello);
 
-    this.peerManager.on('peerConnected', (nodeId, _info) => {
+    this.peerManager.on('peerConnected', (nodeId, info) => {
       logger.info(`[NodeServer] Outbound peer connected: ${nodeId}`);
+      this.emitPeerIdentified(nodeId, info.nodePubkeyPem);
     });
 
     this.peerManager.on('peerDisconnected', (url) => {
@@ -165,6 +167,23 @@ export class NodeServer {
       if (p.nodeId) ids.add(p.nodeId);
     }
     return Array.from(ids);
+  }
+
+  // ── Peer public key registry (populated after NODE_HELLO handshake) ─────────
+  private peerPubkeys: Map<string, string> = new Map();
+  private _peerIdentifiedListeners: ((nodeId: string, pubkeyPem: string) => void)[] = [];
+
+  getPeerPubkeys(): Map<string, string> {
+    return new Map(this.peerPubkeys);
+  }
+
+  onPeerIdentified(listener: (nodeId: string, pubkeyPem: string) => void): void {
+    this._peerIdentifiedListeners.push(listener);
+  }
+
+  private emitPeerIdentified(nodeId: string, pubkeyPem: string): void {
+    this.peerPubkeys.set(nodeId, pubkeyPem);
+    for (const l of this._peerIdentifiedListeners) l(nodeId, pubkeyPem);
   }
 
   // Simple event emitter for DKG / signing layers

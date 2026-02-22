@@ -92,6 +92,15 @@ export const keygenCommand = new Command('keygen')
       coordinator.handleMessage(nodeId, msg as { type: any; payload: unknown });
     });
 
+    // Wire peer pubkeys for Round 3 share encryption
+    nodeServer.onPeerIdentified((nodeId, pubkeyPem) => {
+      coordinator.setPeerPubkey(nodeId, pubkeyPem);
+    });
+    // Seed pubkeys for peers already connected during the 3s wait
+    for (const [nodeId, pubkeyPem] of nodeServer.getPeerPubkeys()) {
+      coordinator.setPeerPubkey(nodeId, pubkeyPem);
+    }
+
     console.log(chalk.cyan('  Starting DKG ceremony...\n'));
 
     try {
