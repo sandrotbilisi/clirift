@@ -1,0 +1,20 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npm install:*)",
+      "Bash(npm run dev:*)",
+      "Bash(npm run build:*)",
+      "Bash(npm run build:bundle:*)",
+      "Bash(npm run build:pkg:*)",
+      "Bash(npm run build:exe:*)",
+      "Bash(cmd /c \"echo test | riftberry.bat --help\")",
+      "Bash(node dist/cli/index.js:*)",
+      "Bash(npm uninstall:*)",
+      "Bash(tar:*)",
+      "Bash(npm run build:deploy:*)",
+      "Bash(xargs:*)",
+      "Bash(npx tsc:*)",
+      "Bash(npm test:*)"
+    ]
+  }
+}
