@@ -124,9 +124,10 @@ export function assembleSignature(
     sTotal = (sTotal + hexToScalar(r3data.partialSig)) % CURVE_ORDER;
   }
 
-  // Determine recovery ID (v): try both 27 and 28
-  // In production, use ecrecover to verify which v gives the correct address
-  const v = 27; // simplified — real implementation should try both
+  // Determine recovery ID from R.y parity (same R all signers computed)
+  const RPoint = hexToPoint(state.R!);
+  const yParity = Number(RPoint.toAffine().y % 2n); // 0 = even, 1 = odd
+  const v = yParity + 27; // 27 or 28
 
   return {
     r: state.r,

@@ -1,5 +1,6 @@
 import { EventEmitter } from 'events';
 import { v4 as uuidv4 } from 'uuid';
+import { serializeTransaction } from 'viem';
 import {
   SigningSessionState,
   SignerInfo,
@@ -62,6 +63,9 @@ export class SigningCoordinator extends EventEmitter {
   private peerPubkeys: Map<string, string> = new Map();
   private opts: SigningCoordinatorOptions;
   private timeoutHandle: NodeJS.Timeout | null = null;
+  private pendingRawTx: RawTxData | null = null;
+  private pendingTxHash: string | null = null;
+  private pendingDerivationPath: string | null = null;
 
   constructor(opts: SigningCoordinatorOptions) {
     super();
@@ -70,6 +74,10 @@ export class SigningCoordinator extends EventEmitter {
 
   /** Initiate a signing session as the request initiator */
   async initiate(rawTx: RawTxData, derivationPath: string, txHash: string): Promise<void> {
+    this.pendingRawTx = rawTx;
+    this.pendingTxHash = txHash;
+    this.pendingDerivationPath = derivationPath;
+
     const sessionId = uuidv4();
     const deadline = Date.now() + this.opts.timeoutMs;
 
@@ -169,9 +177,9 @@ export class SigningCoordinator extends EventEmitter {
 
       this.session = createSigningSession(
         payload.sessionId,
-        '', // txHash — we need to store it when we broadcast the request
-        {} as RawTxData,
-        '',
+        this.pendingTxHash ?? '',
+        this.pendingRawTx ?? {} as RawTxData,
+        this.pendingDerivationPath ?? '',
         Date.now() + this.opts.timeoutMs,
         allSigners,
         this.opts.nodeId
@@ -248,8 +256,30 @@ export class SigningCoordinator extends EventEmitter {
 
     logger.info(`[SigningCoordinator] Signature assembled: r=${sig.r} s=${sig.s} v=${sig.v}`);
 
-    // In production: RLP-encode the signed transaction using viem
-    const signedTxHex = `0x${sig.r}${sig.s}`; // placeholder — real impl uses viem serializeTransaction
+    const rawTx = this.session.rawTx;
+    let signedTxHex: string;
+    if (rawTx?.to) {
+      signedTxHex = serializeTransaction(
+        {
+          type: 'eip1559',
+          chainId: rawTx.chainId,
+          nonce: rawTx.nonce,
+          maxFeePerGas: BigInt(rawTx.maxFeePerGas),
+          maxPriorityFeePerGas: BigInt(rawTx.maxPriorityFeePerGas),
+          gas: BigInt(rawTx.gasLimit),
+          to: rawTx.to as `0x${string}`,
+          value: BigInt(rawTx.value),
+          data: rawTx.data as `0x${string}`,
+        },
+        {
+          r: `0x${sig.r}` as `0x${string}`,
+          s: `0x${sig.s}` as `0x${string}`,
+          yParity: (sig.v - 27) as 0 | 1,
+        }
+      );
+    } else {
+      signedTxHex = `0x${sig.r}${sig.s}`;
+    }
 
     const complete: SignCompletePayload = {
       sessionId: this.session.sessionId,

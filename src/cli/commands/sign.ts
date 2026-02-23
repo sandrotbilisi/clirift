@@ -7,7 +7,7 @@ import { KeyShareStore } from '../../storage/KeyShareStore';
 import { loadOrCreateNodeIdentity } from '../../network/security/NodeIdentity';
 import { AddressIndex } from '../../wallet/AddressIndex';
 import { RawTxData } from '../../network/protocol/Message';
-import { keccak256 } from 'viem';
+import { keccak256, serializeTransaction } from 'viem';
 
 export const signCommand = new Command('sign')
   .description('Initiate a 2-of-3 threshold signing session for an Ethereum transaction')
@@ -80,9 +80,19 @@ export const signCommand = new Command('sign')
       chainId: config.CLIRFT_CHAIN_ID,
     };
 
-    // Compute a simplified txHash (in production use viem's serializeTransaction + keccak256)
-    const txDataStr = JSON.stringify({ ...rawTx, type: '0x02' });
-    const txHash = keccak256(Buffer.from(txDataStr) as unknown as `0x${string}`).slice(2);
+    // Compute the proper EIP-1559 signing hash: keccak256(RLP(unsigned tx))
+    const unsignedSerialized = serializeTransaction({
+      type: 'eip1559',
+      chainId: rawTx.chainId,
+      nonce: rawTx.nonce,
+      maxFeePerGas: BigInt(rawTx.maxFeePerGas),
+      maxPriorityFeePerGas: BigInt(rawTx.maxPriorityFeePerGas),
+      gas: BigInt(rawTx.gasLimit),
+      to: rawTx.to as `0x${string}`,
+      value: BigInt(rawTx.value),
+      data: rawTx.data as `0x${string}`,
+    });
+    const txHash = keccak256(unsignedSerialized).slice(2); // strip 0x — stored as raw hex internally
 
     const identity = loadOrCreateNodeIdentity(config.CLIRFT_DATA_DIR, config.CLIRFT_NODE_ID);
 
@@ -132,9 +142,24 @@ export const signCommand = new Command('sign')
       console.log(`  Raw tx   : ${chalk.cyan(result.signedTxHex)}`);
 
       if (!options.dryRun && config.CLIRFT_ETH_RPC_URL) {
-        console.log(chalk.yellow('\n  Broadcasting to Ethereum network...'));
-        // In production: use viem's publicClient.sendRawTransaction(result.signedTxHex)
-        console.log(chalk.gray('  (RPC broadcast not implemented in this build)'));
+        console.log(chalk.yellow('\n  Broadcasting transaction...'));
+        try {
+          const res = await fetch(config.CLIRFT_ETH_RPC_URL, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              jsonrpc: '2.0',
+              id: 1,
+              method: 'eth_sendRawTransaction',
+              params: [result.signedTxHex],
+            }),
+          });
+          const json = await res.json() as { result?: string; error?: { message: string } };
+          if (json.error) throw new Error(json.error.message);
+          console.log(chalk.green(`  Broadcast! Tx hash: ${json.result}`));
+        } catch (broadcastErr) {
+          console.error(chalk.red('  Broadcast failed:'), broadcastErr);
+        }
       } else if (options.dryRun) {
         console.log(chalk.gray('\n  Dry run — transaction not broadcast.'));
       }
