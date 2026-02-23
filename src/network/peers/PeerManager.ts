@@ -95,6 +95,19 @@ export class PeerManager extends EventEmitter {
     }
   }
 
+  /** Send pre-serialized bytes to all connected peers (same msg.id as TlsServer.broadcastRaw) */
+  broadcastRaw(data: string): void {
+    for (const [url, conn] of this.connections) {
+      if (conn.currentState === 'connected') {
+        try {
+          conn.sendRaw(data);
+        } catch (err) {
+          logger.warn(`[PeerManager] Failed to send to ${url}:`, err);
+        }
+      }
+    }
+  }
+
   /** Send a message to a specific peer by nodeId */
   sendTo<T>(targetNodeId: string, type: MessageType, payload: T): boolean {
     for (const conn of this.connections.values()) {

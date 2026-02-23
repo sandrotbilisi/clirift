@@ -174,6 +174,11 @@ export class TlsServer extends EventEmitter {
   broadcast<T>(type: MessageType, payload: T): void {
     const msg = createMessage(type, payload);
     const data = serializeMessage(msg);
+    this.broadcastRaw(data);
+  }
+
+  /** Send pre-serialized bytes to all handshaked inbound peers (use from NodeServer.broadcast) */
+  broadcastRaw(data: string): void {
     for (const peer of this.peers.values()) {
       if (peer.handshakeComplete && peer.socket.readyState === WebSocket.OPEN) {
         peer.socket.send(data);

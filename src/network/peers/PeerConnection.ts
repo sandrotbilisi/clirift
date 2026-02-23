@@ -105,6 +105,14 @@ export class PeerConnection extends EventEmitter {
     this.ws.send(serializeMessage(msg));
   }
 
+  /** Send pre-serialized bytes to this peer (use from PeerManager.broadcastRaw) */
+  sendRaw(data: string): void {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+      throw new ConnectionError(`Peer ${this.url} is not connected`);
+    }
+    this.ws.send(data);
+  }
+
   private connectOnce(): Promise<void> {
     return new Promise((resolve, reject) => {
       this.state = 'connecting';

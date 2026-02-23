@@ -5,6 +5,7 @@ import { TlsServer } from '../network/transport/TlsServer';
 import { PeerManager } from '../network/peers/PeerManager';
 import { parsePeerList } from '../network/peers/StaticPeerConfig';
 import { Message, MessageType, NodeHelloPayload } from '../network/protocol/Message';
+import { createMessage, serializeMessage } from '../network/protocol/MessageCodec';
 import logger from '../utils/logger';
 
 export class NodeServer {
@@ -149,10 +150,13 @@ export class NodeServer {
     }
   }
 
-  /** Broadcast a message to all connected peers (inbound + outbound) */
+  /** Broadcast a message to all connected peers (inbound + outbound).
+   *  Creates ONE message with ONE UUID so the receiver's dedup check works correctly. */
   broadcast<T>(type: MessageType, payload: T): void {
-    this.tlsServer.broadcast(type, payload);
-    this.peerManager.broadcast(type, payload);
+    const msg = createMessage(type, payload);
+    const data = serializeMessage(msg);
+    this.tlsServer.broadcastRaw(data);
+    this.peerManager.broadcastRaw(data);
   }
 
   /** Send a message to a specific peer by nodeId */

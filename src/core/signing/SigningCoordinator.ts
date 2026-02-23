@@ -227,7 +227,8 @@ export class SigningCoordinator extends EventEmitter {
   }
 
   private async startRound2(): Promise<void> {
-    if (!this.session) return;
+    if (!this.session || this.session.status !== 'round1') return;
+    this.session = { ...this.session, status: 'round2' }; // reserve before any await
     const { updatedState, broadcast } = executeSignRound2(this.session, this.opts.myPrivateKeyPem);
     this.session = updatedState;
     this.opts.nodeServer.broadcast(MessageType.SIGN_ROUND2, broadcast);
@@ -245,7 +246,8 @@ export class SigningCoordinator extends EventEmitter {
   }
 
   private async startRound3(): Promise<void> {
-    if (!this.session) return;
+    if (!this.session || this.session.status !== 'round2') return;
+    this.session = { ...this.session, status: 'round3' }; // reserve before await
     const keyShare = await this.opts.keyShareStore.load();
     const x_i = hexToScalar(keyShare.secretShare);
 
