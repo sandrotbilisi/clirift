@@ -178,6 +178,7 @@ export interface RawTxData {
 export interface SignRequestPayload {
   sessionId: string;
   initiatorNodeId: string;
+  initiatorPartyIndex: number;  // so participants can build the correct signers list
   /** Keccak256 of the EIP-1559 signing hash (hex, 32 bytes) */
   txHash: string;
   rawTx: RawTxData;

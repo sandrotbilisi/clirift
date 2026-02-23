@@ -66,6 +66,8 @@ export class SigningCoordinator extends EventEmitter {
   private pendingRawTx: RawTxData | null = null;
   private pendingTxHash: string | null = null;
   private pendingDerivationPath: string | null = null;
+  /** Prevents async race where two duplicate messages both pass the `if (!this.session)` guard */
+  private sessionPending = false;
 
   constructor(opts: SigningCoordinatorOptions) {
     super();
@@ -78,12 +80,15 @@ export class SigningCoordinator extends EventEmitter {
     this.pendingTxHash = txHash;
     this.pendingDerivationPath = derivationPath;
 
+    const keyShare = await this.opts.keyShareStore.load();
+
     const sessionId = uuidv4();
     const deadline = Date.now() + this.opts.timeoutMs;
 
     const request: SignRequestPayload = {
       sessionId,
       initiatorNodeId: this.opts.nodeId,
+      initiatorPartyIndex: keyShare.partyIndex,
       txHash,
       rawTx,
       derivationPath,
@@ -128,34 +133,46 @@ export class SigningCoordinator extends EventEmitter {
   }
 
   private async onRequest(payload: SignRequestPayload): Promise<void> {
-    if (this.session) return; // already in a session
+    if (this.session || this.sessionPending) return;
+    this.sessionPending = true;
 
-    // Auto-accept (in production: could prompt user for approval)
-    logger.info(`[SigningCoordinator] Received sign request ${payload.sessionId}`);
+    try {
+      logger.info(`[SigningCoordinator] Received sign request ${payload.sessionId}`);
 
-    const keyShare = await this.opts.keyShareStore.load();
-    const partyIndex = keyShare.partyIndex;
+      const keyShare = await this.opts.keyShareStore.load();
+      const partyIndex = keyShare.partyIndex;
 
-    const accept: SignAcceptPayload = {
-      sessionId: payload.sessionId,
-      nodeId: this.opts.nodeId,
-      partyIndex,
-    };
+      const accept: SignAcceptPayload = {
+        sessionId: payload.sessionId,
+        nodeId: this.opts.nodeId,
+        partyIndex,
+      };
 
-    this.opts.nodeServer.sendTo(payload.initiatorNodeId, MessageType.SIGN_ACCEPT, accept);
-    logger.info(`[SigningCoordinator] Accepted signing session ${payload.sessionId}`);
+      this.opts.nodeServer.sendTo(payload.initiatorNodeId, MessageType.SIGN_ACCEPT, accept);
+      logger.info(`[SigningCoordinator] Accepted signing session ${payload.sessionId}`);
 
-    // Create session state as participant
-    const mySignerInfo: SignerInfo = { nodeId: this.opts.nodeId, partyIndex };
-    this.session = createSigningSession(
-      payload.sessionId,
-      payload.txHash,
-      payload.rawTx,
-      payload.derivationPath,
-      payload.deadline,
-      [mySignerInfo], // will be updated when we know full signer list
-      this.opts.nodeId
-    );
+      // Build signers list: [initiator, me] — enough for a 2-of-3 threshold
+      const initiatorSigner: SignerInfo = {
+        nodeId: payload.initiatorNodeId,
+        partyIndex: payload.initiatorPartyIndex,
+      };
+      const mySignerInfo: SignerInfo = { nodeId: this.opts.nodeId, partyIndex };
+
+      this.session = createSigningSession(
+        payload.sessionId,
+        payload.txHash,
+        payload.rawTx,
+        payload.derivationPath,
+        payload.deadline,
+        [initiatorSigner, mySignerInfo],
+        this.opts.nodeId
+      );
+
+      // Start Round 1 immediately as a participant
+      await this.startRound1();
+    } finally {
+      this.sessionPending = false;
+    }
   }
 
   private async onAccept(fromNodeId: string, payload: SignAcceptPayload): Promise<void> {
@@ -163,7 +180,8 @@ export class SigningCoordinator extends EventEmitter {
     logger.info(`[SigningCoordinator] ${fromNodeId} accepted signing (party ${payload.partyIndex}). Total: ${this.acceptedSigners.size}`);
 
     // Start signing once we have at least threshold-1 acceptances
-    if (this.acceptedSigners.size >= 1 && !this.session) {
+    if (this.acceptedSigners.size >= 1 && !this.session && !this.sessionPending) {
+      this.sessionPending = true;
       // Load key share
       const keyShare = await this.opts.keyShareStore.load();
 
@@ -186,6 +204,7 @@ export class SigningCoordinator extends EventEmitter {
       );
 
       await this.startRound1(keyShare);
+      this.sessionPending = false;
     }
   }
 

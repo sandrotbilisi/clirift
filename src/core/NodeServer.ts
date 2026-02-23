@@ -11,6 +11,8 @@ export class NodeServer {
   private readonly config: Config;
   private tlsServer!: TlsServer;
   private peerManager!: PeerManager;
+  /** Deduplicates messages that arrive via both inbound and outbound connections */
+  private seenMessageIds = new Set<string>();
 
   constructor(config: Config) {
     this.config = config;
@@ -102,6 +104,14 @@ export class NodeServer {
     nodeId: string | null,
     msg: Message
   ): void {
+    // Drop messages we've already processed (same msg arrives on both inbound+outbound connections)
+    if (this.seenMessageIds.has(msg.id)) {
+      logger.debug(`[NodeServer] Duplicate message ${msg.id} (type=${msg.type}) dropped`);
+      return;
+    }
+    this.seenMessageIds.add(msg.id);
+    if (this.seenMessageIds.size > 50_000) this.seenMessageIds.clear();
+
     logger.debug(
       `[NodeServer] Message from ${nodeId ?? 'unknown'} (${socketId ?? 'outbound'}): type=${msg.type}`
     );
