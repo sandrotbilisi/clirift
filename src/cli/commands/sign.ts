@@ -119,6 +119,18 @@ export const signCommand = new Command('sign')
       timeoutMs: config.CLIRFT_SIGN_TIMEOUT_MS,
     });
 
+    // Give the coordinator the RSA public keys of all already-connected peers
+    // (collected during NODE_HELLO handshakes in the 3-second wait above).
+    // Without this, MtA ciphertexts are empty, K = myKi only, and the
+    // threshold signature is cryptographically invalid.
+    for (const [nodeId, pubkeyPem] of nodeServer.getPeerPubkeys()) {
+      coordinator.setPeerPubkey(nodeId, pubkeyPem);
+    }
+    // Also catch any peers that connect after coordinator creation
+    nodeServer.onPeerIdentified((nodeId, pubkeyPem) => {
+      coordinator.setPeerPubkey(nodeId, pubkeyPem);
+    });
+
     nodeServer.on('signMessage', (nodeId, msg) => {
       coordinator.handleMessage(nodeId, msg as { type: any; payload: unknown });
     });
