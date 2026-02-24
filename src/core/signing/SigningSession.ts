@@ -41,7 +41,9 @@ export interface SigningSessionState {
   round1Received: Map<string, { gammaCommitment: string; mtaCiphertext: string }>;
 
   // Round 2 state (MtA responses)
-  myDeltaI?: bigint;       // delta_i = k_i * gamma_i + sum(alpha_ij) + sum(beta_ji)
+  myDeltaI?: bigint;       // delta_i = k_i * gamma_i + sum(alpha_ij)
+  /** Decrypted peer k_j values from Round 2 MtA — used in Round 3 to compute K = sum(k_i) */
+  peerKi?: Map<string, bigint>; // nodeId → peer's k_j scalar
   /** Round 2 messages received */
   round2Received: Map<string, { mtaResponse: string; deltaShare: string }>;
 
@@ -83,6 +85,7 @@ export function createSigningSession(
     signers,
     mySignerIndex: mySignerIndex + 1,
     round1Received: new Map(),
+    peerKi: new Map(),
     round2Received: new Map(),
     round3Received: new Map(),
   };

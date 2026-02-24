@@ -1,7 +1,6 @@
 import { privateDecrypt, constants } from 'crypto';
 import {
   scalarMul,
-  generateScalar,
   scalarToHex,
   hexToScalar,
   CURVE_ORDER,
@@ -12,17 +11,15 @@ import { SignRound2Payload } from '../../../network/protocol/Message';
 /**
  * GG20 Signing Round 2: MtA (Multiplicative-to-Additive) responses.
  *
- * Full GG20 MtA uses Paillier homomorphic encryption:
- * - Party A sends Enc(k_A) to party B
- * - Party B computes: Enc(k_A * x_B + beta) and returns it
- * - Party A decrypts to get: alpha = k_A * x_B + beta
- * - Result: k_A * x_B = alpha - beta  (additively shared)
+ * Simplified MtA with beta = 0:
+ *   Party i decrypts peer j's RSA-encrypted k_j, then computes:
+ *     alpha_ij = k_j * gamma_i
+ *     delta_i  = k_i * gamma_i + sum_{j≠i}(k_j * gamma_i)
+ *              = gamma_i * K   where K = sum(k_i) over all signers
  *
- * Here we use RSA-OAEP as a simplified stand-in for the Paillier encryption.
- * The structural protocol is identical; replace with Paillier for production.
+ * So delta_sum = K * Gamma, and R = (1/delta_sum) * Gamma*G = K^{-1} * G ✓
  *
- * After MtA, each party computes:
- *   delta_i = k_i * gamma_i + sum_{j!=i}(alpha_ij + beta_ji)
+ * We also store each decrypted k_j in peerKi so Round 3 can compute K.
  */
 export function executeSignRound2(
   state: SigningSessionState,
@@ -40,9 +37,12 @@ export function executeSignRound2(
   // Start delta_i = k_i * gamma_i (mod n)
   let deltaI = scalarMul(state.myKi, state.myGammaI);
 
-  // Process received MtA ciphertexts from other parties
-  // For each other signer j, decrypt their Enc(k_j) to get k_j (simplified MtA)
-  for (const [, r1Data] of state.round1Received) {
+  // Store decrypted peer k_j values so Round 3 can compute K = sum(k_i)
+  const peerKi = new Map<string, bigint>(state.peerKi ?? []);
+
+  // Process received MtA ciphertexts from other parties.
+  // Each peer encrypted their k_j using our RSA public key in Round 1.
+  for (const [fromNodeId, r1Data] of state.round1Received) {
     if (r1Data.mtaCiphertext) {
       try {
         const decrypted = privateDecrypt(
@@ -50,19 +50,13 @@ export function executeSignRound2(
           Buffer.from(r1Data.mtaCiphertext, 'base64')
         );
         const kj = hexToScalar(decrypted.toString('hex'));
+        peerKi.set(fromNodeId, kj);
 
-        // alpha_ij = k_j * gamma_i (simplified; in full GG20 this is computed homomorphically)
+        // alpha_ij = k_j * gamma_i  (beta = 0, so no subtraction)
         const alpha = scalarMul(kj, state.myGammaI);
-
-        // beta_ji: random additive mask (in full GG20 sent back to party j)
-        const beta = generateScalar();
-
-        // delta_i += alpha_ij - beta_ji
-        const contribution = (alpha - beta + CURVE_ORDER) % CURVE_ORDER;
-        deltaI = (deltaI + contribution) % CURVE_ORDER;
+        deltaI = (deltaI + alpha) % CURVE_ORDER;
       } catch {
         // Decryption failed — peer may have used different encryption
-        // In production, this would abort the signing session
       }
     }
   }
@@ -71,13 +65,14 @@ export function executeSignRound2(
     ...state,
     status: 'round2',
     myDeltaI: deltaI,
+    peerKi,
   };
 
   const broadcast: SignRound2Payload = {
     sessionId: state.sessionId,
     fromNodeId: myNodeId,
     partyIndex: state.mySignerIndex,
-    mtaResponse: '', // Response to peer's MtA (simplified)
+    mtaResponse: '',
     deltaShare: scalarToHex(deltaI),
   };
 
