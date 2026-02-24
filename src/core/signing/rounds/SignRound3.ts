@@ -164,12 +164,19 @@ export function assembleSignature(
   }
 
   const RPoint = hexToPoint(state.R!);
-  const yParity = Number(RPoint.toAffine().y % 2n); // 0 = even, 1 = odd
-  const v = yParity + 27; // 27 or 28
+  let yParity = Number(RPoint.toAffine().y % 2n); // 0 = even, 1 = odd
+
+  // EIP-2 low-s normalization: all Ethereum chains require s <= n/2.
+  // If s > n/2, use s' = n - s and flip the recovery bit.
+  const HALF_ORDER = CURVE_ORDER >> 1n;
+  if (sTotal > HALF_ORDER) {
+    sTotal = CURVE_ORDER - sTotal;
+    yParity = 1 - yParity;
+  }
 
   return {
     r: state.r,
     s: scalarToHex(sTotal),
-    v,
+    v: yParity + 27, // 27 or 28
   };
 }
