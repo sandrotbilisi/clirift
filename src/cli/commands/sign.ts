@@ -67,7 +67,7 @@ export const signCommand = new Command('sign')
     );
     const signingEntry = addrIndex.deriveOne(parseInt(options.index, 10));
 
-    const gweiToWei = (gwei: string) => (BigInt(Math.round(parseFloat(gwei) * 1e9)) * 1_000_000_000n).toString();
+    const gweiToWei = (gwei: string) => BigInt(Math.round(parseFloat(gwei) * 1e9)).toString();
 
     const rawTx: RawTxData = {
       to: options.to,

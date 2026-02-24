@@ -14,7 +14,9 @@
       "Bash(npm run build:deploy:*)",
       "Bash(xargs:*)",
       "Bash(npx tsc:*)",
-      "Bash(npm test:*)"
+      "Bash(npm test:*)",
+      "Bash(npx vitest:*)",
+      "Bash(python:*)"
     ]
   }
 }
