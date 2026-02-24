@@ -1,7 +1,9 @@
 import { HDKey } from '@scure/bip32';
 import { sha512 } from '@noble/hashes/sha512';
 import { hmac } from '@noble/hashes/hmac';
+import { secp256k1 as secp } from '@noble/curves/secp256k1';
 import { CLIRiftError } from '../utils/errors';
+import { CURVE_ORDER } from '../crypto/secp256k1';
 
 /**
  * Construct a BIP32 HD wallet root from a raw secp256k1 compressed public key (33 bytes).
@@ -71,4 +73,60 @@ export function deriveChildPublicKey(hdKey: HDKey, index: number): string {
 /** Build the BIP44 derivation path string for display purposes */
 export function bip44Path(index: number): string {
   return `m/44'/60'/0'/0/${index}`;
+}
+
+/**
+ * Compute the additive scalar tweak for one non-hardened BIP32 child derivation step.
+ *
+ *   IL || IR = HMAC-SHA512(key=parentChainCode, data=parentCompressedPubkey || index_BE32)
+ *   child_priv = parent_priv + IL (mod n)
+ *
+ * Returns IL as a bigint and the derived child pubkey/chainCode for chaining.
+ */
+function nonHardenedTweakStep(
+  parentPubkeyHex: string,
+  parentChainCodeHex: string,
+  index: number
+): { IL: bigint; childPubkeyHex: string; childChainCodeHex: string } {
+  const parentPubBytes = Buffer.from(parentPubkeyHex, 'hex');
+  const parentCCBytes = Buffer.from(parentChainCodeHex, 'hex');
+
+  const indexBuf = Buffer.allocUnsafe(4);
+  indexBuf.writeUInt32BE(index, 0);
+
+  const I = Buffer.from(hmac(sha512, parentCCBytes, Buffer.concat([parentPubBytes, indexBuf])));
+  const IL = I.slice(0, 32);
+  const IR = I.slice(32);
+
+  const ILn = BigInt('0x' + IL.toString('hex'));
+
+  // child pubkey = IL*G + parent_pubkey (for chaining to the next step)
+  const parentPoint = secp.ProjectivePoint.fromHex(parentPubkeyHex);
+  const childPoint = secp.ProjectivePoint.BASE.multiply(ILn).add(parentPoint);
+  const childPubkeyHex = Buffer.from(childPoint.toRawBytes(true)).toString('hex');
+
+  return { IL: ILn, childPubkeyHex, childChainCodeHex: IR.toString('hex') };
+}
+
+/**
+ * Compute the total scalar tweak needed to adapt a master private key share for
+ * signing as the BIP32 child address at the given index.
+ *
+ * `deriveChildPublicKey` does exactly two non-hardened steps: deriveChild(0).deriveChild(index).
+ * The corresponding private-key relationship is:
+ *   child_priv = master_priv + IL_0 + IL_index  (mod n)
+ *
+ * For threshold signing, each party computes:
+ *   child_share_i = x_i + tweak
+ * Lagrange combination then gives:
+ *   Σ L_i * child_share_i = Σ(L_i * x_i) + tweak * Σ(L_i) = master_priv + tweak = child_priv ✓
+ */
+export function computeChildKeyTweak(
+  pkMasterHex: string,
+  chainCodeHex: string,
+  addressIndex: number
+): bigint {
+  const step0 = nonHardenedTweakStep(pkMasterHex, chainCodeHex, 0);
+  const stepIdx = nonHardenedTweakStep(step0.childPubkeyHex, step0.childChainCodeHex, addressIndex);
+  return (step0.IL + stepIdx.IL) % CURVE_ORDER;
 }

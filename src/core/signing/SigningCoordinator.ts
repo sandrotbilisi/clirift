@@ -1,6 +1,7 @@
 import { EventEmitter } from 'events';
 import { v4 as uuidv4 } from 'uuid';
 import { serializeTransaction } from 'viem';
+import { computeChildKeyTweak } from '../../wallet/HdWallet';
 import {
   SigningSessionState,
   SignerInfo,
@@ -34,6 +35,7 @@ import {
 } from '../../network/protocol/Message';
 import { NodeServer } from '../NodeServer';
 import { KeyShareStore } from '../../storage/KeyShareStore';
+import { CURVE_ORDER } from '../../crypto/secp256k1';
 import logger from '../../utils/logger';
 
 export interface SigningCoordinatorOptions {
@@ -145,7 +147,11 @@ export class SigningCoordinator extends EventEmitter {
 
       const keyShare = await this.opts.keyShareStore.load();
       const partyIndex = keyShare.partyIndex;
-      this.cachedSecretShare = hexToScalar(keyShare.secretShare);
+      // Apply BIP32 child key tweak: child_share = x_i + IL_0 + IL_index (mod n)
+      // This makes the threshold signature verify against the derived address, not pkMaster.
+      const addrIndex = parseAddressIndex(payload.derivationPath);
+      const tweak = computeChildKeyTweak(keyShare.pkMaster, keyShare.chainCode, addrIndex);
+      this.cachedSecretShare = (hexToScalar(keyShare.secretShare) + tweak) % CURVE_ORDER;
 
       const accept: SignAcceptPayload = {
         sessionId: payload.sessionId,
@@ -190,7 +196,9 @@ export class SigningCoordinator extends EventEmitter {
       // Use keyshare cached in initiate() — avoids an async gap where incoming
       // Round 1 messages would arrive while session is still null and get dropped.
       const keyShare = this.initiatorKeyShare!;
-      this.cachedSecretShare = hexToScalar(keyShare.secretShare);
+      const addrIndex = parseAddressIndex(this.pendingDerivationPath ?? '');
+      const tweak = computeChildKeyTweak(keyShare.pkMaster, keyShare.chainCode, addrIndex);
+      this.cachedSecretShare = (hexToScalar(keyShare.secretShare) + tweak) % CURVE_ORDER;
 
       const mySignerInfo: SignerInfo = { nodeId: this.opts.nodeId, partyIndex: keyShare.partyIndex };
       const otherSigners: SignerInfo[] = Array.from(this.acceptedSigners.values()).map((a) => ({
@@ -357,7 +365,14 @@ export class SigningCoordinator extends EventEmitter {
   }
 }
 
-// Helper
+// Helpers
 function hexToScalar(hex: string): bigint {
   return BigInt('0x' + hex.replace(/^0x/, ''));
+}
+
+/** Extract the final numeric index from a BIP44 path like "m/44'/60'/0'/0/5" → 5 */
+function parseAddressIndex(derivationPath: string): number {
+  const parts = derivationPath.split('/');
+  const last = parseInt(parts[parts.length - 1], 10);
+  return isNaN(last) ? 0 : last;
 }
