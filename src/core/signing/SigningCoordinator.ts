@@ -68,6 +68,8 @@ export class SigningCoordinator extends EventEmitter {
   private pendingDerivationPath: string | null = null;
   /** Cached key share from initiate() so onAccept creates the session without an async gap */
   private initiatorKeyShare: Awaited<ReturnType<KeyShareStore['load']>> | null = null;
+  /** Cached x_i scalar — set on both initiator and participant paths so startRound3 has no async gap */
+  private cachedSecretShare: bigint | null = null;
   /** Prevents async race where two duplicate messages both pass the `if (!this.session)` guard */
   private sessionPending = false;
 
@@ -143,6 +145,7 @@ export class SigningCoordinator extends EventEmitter {
 
       const keyShare = await this.opts.keyShareStore.load();
       const partyIndex = keyShare.partyIndex;
+      this.cachedSecretShare = hexToScalar(keyShare.secretShare);
 
       const accept: SignAcceptPayload = {
         sessionId: payload.sessionId,
@@ -187,6 +190,7 @@ export class SigningCoordinator extends EventEmitter {
       // Use keyshare cached in initiate() — avoids an async gap where incoming
       // Round 1 messages would arrive while session is still null and get dropped.
       const keyShare = this.initiatorKeyShare!;
+      this.cachedSecretShare = hexToScalar(keyShare.secretShare);
 
       const mySignerInfo: SignerInfo = { nodeId: this.opts.nodeId, partyIndex: keyShare.partyIndex };
       const otherSigners: SignerInfo[] = Array.from(this.acceptedSigners.values()).map((a) => ({
@@ -244,15 +248,16 @@ export class SigningCoordinator extends EventEmitter {
     logger.info(`[SigningCoordinator] Round 2 from ${fromNodeId} (${this.session.round2Received.size}/${this.session.signers.length - 1})`);
 
     if (isSignRound2Complete(this.session)) {
-      await this.startRound3();
+      this.startRound3();
     }
   }
 
-  private async startRound3(): Promise<void> {
+  private startRound3(): void {
     if (!this.session || this.session.status !== 'round2') return;
-    this.session = { ...this.session, status: 'round3' }; // reserve before await
-    const keyShare = await this.opts.keyShareStore.load();
-    const x_i = hexToScalar(keyShare.secretShare);
+    // Set status synchronously — no await below, so no window for
+    // an incoming Round 3 message to call finalize() before myPartialSig is set.
+    this.session = { ...this.session, status: 'round3' };
+    const x_i = this.cachedSecretShare!;
 
     const { updatedState, broadcast } = executeSignRound3(
       this.session,
