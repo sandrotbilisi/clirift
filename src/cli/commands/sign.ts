@@ -69,11 +69,36 @@ export const signCommand = new Command('sign')
 
     const gweiToWei = (gwei: string) => BigInt(Math.round(parseFloat(gwei) * 1e9)).toString();
 
+    // Resolve nonce: use --nonce if provided, otherwise fetch pending nonce from RPC
+    let nonce: number;
+    let nonceSource: string;
+    if (options.nonce !== undefined) {
+      nonce = parseInt(options.nonce, 10);
+      nonceSource = 'manual';
+    } else if (config.CLIRFT_ETH_RPC_URL) {
+      const nonceRes = await fetch(config.CLIRFT_ETH_RPC_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          jsonrpc: '2.0', id: 1,
+          method: 'eth_getTransactionCount',
+          params: [signingEntry.address, 'pending'],
+        }),
+      });
+      const nonceJson = await nonceRes.json() as { result?: string; error?: { message: string } };
+      if (nonceJson.error) throw new Error(`Failed to fetch nonce: ${nonceJson.error.message}`);
+      nonce = parseInt(nonceJson.result!, 16);
+      nonceSource = 'auto';
+    } else {
+      nonce = 0;
+      nonceSource = 'default';
+    }
+
     const rawTx: RawTxData = {
       to: options.to,
       value: (BigInt(Math.round(parseFloat(options.value) * 1e18))).toString(),
       data: options.data,
-      nonce: parseInt(options.nonce ?? '0', 10),
+      nonce,
       gasLimit: options.gasLimit,
       maxFeePerGas: gweiToWei(options.maxFee),
       maxPriorityFeePerGas: gweiToWei(options.maxPriorityFee),
@@ -101,6 +126,7 @@ export const signCommand = new Command('sign')
     console.log(`  From     : ${chalk.green(signingEntry.address)} (index ${options.index})`);
     console.log(`  To       : ${chalk.yellow(options.to)}`);
     console.log(`  Value    : ${chalk.yellow(options.value)} ETH`);
+    console.log(`  Nonce    : ${chalk.yellow(nonce)}${nonceSource === 'auto' ? chalk.gray(' (fetched from RPC)') : nonceSource === 'default' ? chalk.yellow(' (defaulted — no RPC)') : ''}`);
     console.log(`  Chain ID : ${chalk.yellow(config.CLIRFT_CHAIN_ID)}`);
     console.log(`  Tx Hash  : ${chalk.gray(txHash)}`);
     console.log(chalk.gray('  ─────────────────────────────────────────\n'));
