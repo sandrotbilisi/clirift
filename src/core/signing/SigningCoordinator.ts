@@ -225,6 +225,9 @@ export class SigningCoordinator extends EventEmitter {
 
   private async onRound1(fromNodeId: string, payload: SignRound1Payload): Promise<void> {
     if (!this.session || payload.sessionId !== this.session.sessionId) return;
+    // Ignore messages from nodes outside the signing subset — extra acceptors
+    // would corrupt the gamma-point sum and delta aggregation.
+    if (!this.session.signers.some((s) => s.nodeId === payload.fromNodeId)) return;
     this.session = recordSignRound1(this.session, payload);
     logger.info(`[SigningCoordinator] Round 1 from ${fromNodeId} (${this.session.round1Received.size}/${this.session.signers.length - 1})`);
 
@@ -244,6 +247,7 @@ export class SigningCoordinator extends EventEmitter {
 
   private async onRound2(fromNodeId: string, payload: SignRound2Payload): Promise<void> {
     if (!this.session || payload.sessionId !== this.session.sessionId) return;
+    if (!this.session.signers.some((s) => s.nodeId === payload.fromNodeId)) return;
     this.session = recordSignRound2(this.session, payload);
     logger.info(`[SigningCoordinator] Round 2 from ${fromNodeId} (${this.session.round2Received.size}/${this.session.signers.length - 1})`);
 
@@ -271,6 +275,7 @@ export class SigningCoordinator extends EventEmitter {
 
   private async onRound3(fromNodeId: string, payload: SignRound3Payload): Promise<void> {
     if (!this.session || payload.sessionId !== this.session.sessionId) return;
+    if (!this.session.signers.some((s) => s.nodeId === payload.fromNodeId)) return;
     this.session = recordSignRound3(this.session, payload);
     logger.info(`[SigningCoordinator] Round 3 from ${fromNodeId} (${this.session.round3Received.size}/${this.session.signers.length - 1})`);
 
