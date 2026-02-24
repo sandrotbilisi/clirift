@@ -66,6 +66,8 @@ export class SigningCoordinator extends EventEmitter {
   private pendingRawTx: RawTxData | null = null;
   private pendingTxHash: string | null = null;
   private pendingDerivationPath: string | null = null;
+  /** Cached key share from initiate() so onAccept creates the session without an async gap */
+  private initiatorKeyShare: Awaited<ReturnType<KeyShareStore['load']>> | null = null;
   /** Prevents async race where two duplicate messages both pass the `if (!this.session)` guard */
   private sessionPending = false;
 
@@ -80,7 +82,7 @@ export class SigningCoordinator extends EventEmitter {
     this.pendingTxHash = txHash;
     this.pendingDerivationPath = derivationPath;
 
-    const keyShare = await this.opts.keyShareStore.load();
+    this.initiatorKeyShare = await this.opts.keyShareStore.load();
 
     const sessionId = uuidv4();
     const deadline = Date.now() + this.opts.timeoutMs;
@@ -88,7 +90,7 @@ export class SigningCoordinator extends EventEmitter {
     const request: SignRequestPayload = {
       sessionId,
       initiatorNodeId: this.opts.nodeId,
-      initiatorPartyIndex: keyShare.partyIndex,
+      initiatorPartyIndex: this.initiatorKeyShare.partyIndex,
       txHash,
       rawTx,
       derivationPath,
@@ -182,8 +184,9 @@ export class SigningCoordinator extends EventEmitter {
     // Start signing once we have at least threshold-1 acceptances
     if (this.acceptedSigners.size >= 1 && !this.session && !this.sessionPending) {
       this.sessionPending = true;
-      // Load key share
-      const keyShare = await this.opts.keyShareStore.load();
+      // Use keyshare cached in initiate() — avoids an async gap where incoming
+      // Round 1 messages would arrive while session is still null and get dropped.
+      const keyShare = this.initiatorKeyShare!;
 
       const mySignerInfo: SignerInfo = { nodeId: this.opts.nodeId, partyIndex: keyShare.partyIndex };
       const otherSigners: SignerInfo[] = Array.from(this.acceptedSigners.values()).map((a) => ({
