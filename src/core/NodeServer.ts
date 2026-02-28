@@ -140,6 +140,7 @@ export class NodeServer {
       case MessageType.SIGN_ROUND1:
       case MessageType.SIGN_ROUND2:
       case MessageType.SIGN_ROUND3:
+      case MessageType.SIGN_ROUND4:
       case MessageType.SIGN_COMPLETE:
       case MessageType.SIGN_ABORT:
         this.emit('signMessage', nodeId, msg);
