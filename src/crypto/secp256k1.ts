@@ -100,3 +100,65 @@ export function hmacSha256(key: Uint8Array | Buffer, ...messages: (Uint8Array | 
   for (const m of messages) h.update(m);
   return h.digest();
 }
+
+// ---- Schnorr proof-of-knowledge (Fiat-Shamir) ----
+
+/**
+ * Prove knowledge of `scalar` such that `scalar * G = point`.
+ * Uses a non-interactive Fiat-Shamir Schnorr proof with domain separation via `context`.
+ *
+ * Proof: { R = k*G, s = k + Hash(point||R||context) * scalar mod n }
+ * Verifier checks: s*G == R + Hash(point||R||context) * point
+ */
+export function schnorrProve(
+  scalar: bigint,
+  pointHex: string,
+  context: string,
+): { R: string; s: string } {
+  const k = generateScalar();
+  const R = scalarMulG(k);
+  const Rhex = pointToHex(R);
+
+  const challenge = schnorrChallenge(pointHex, Rhex, context);
+  const s = (k + challenge * scalar) % CURVE_ORDER;
+
+  return { R: Rhex, s: scalarToHex(s) };
+}
+
+/**
+ * Verify a Schnorr proof-of-knowledge.
+ * Returns true iff the proof is valid for the given point and context.
+ */
+export function schnorrVerify(
+  pointHex: string,
+  proof: { R: string; s: string },
+  context: string,
+): boolean {
+  try {
+    const s = hexToScalar(proof.s);
+    if (s === 0n || s >= CURVE_ORDER) return false;
+
+    const challenge = schnorrChallenge(pointHex, proof.R, context);
+
+    // s*G must equal R + challenge*point
+    const sG = scalarMulG(s);
+    const R = hexToPoint(proof.R);
+    const P = hexToPoint(pointHex);
+    const rhs = R.add(P.multiply(challenge));
+
+    return sG.equals(rhs);
+  } catch {
+    return false;
+  }
+}
+
+function schnorrChallenge(pointHex: string, Rhex: string, context: string): bigint {
+  const ctxBytes = Buffer.from(context, 'utf8');
+  const data = Buffer.concat([
+    Buffer.from(pointHex, 'hex'),
+    Buffer.from(Rhex, 'hex'),
+    ctxBytes,
+  ]);
+  const hash = sha256(data);
+  return BigInt('0x' + Buffer.from(hash).toString('hex')) % CURVE_ORDER;
+}

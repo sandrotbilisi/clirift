@@ -35,6 +35,7 @@ export enum MessageType {
   SIGN_ROUND3 = 'sign_round3',
   SIGN_COMPLETE = 'sign_complete',
   SIGN_ABORT = 'sign_abort',
+  SIGN_ROUND4 = 'sign_round4',
 
   // ---- Address derivation (informational) ----
   ADDRESS_QUERY = 'address_query',
@@ -199,37 +200,55 @@ export interface SignRejectPayload {
   reason: string;
 }
 
-/** GG20 Round 1: commitment to k_i and gamma_i */
+/** GG20 Round 1: commitment to gamma_i, Paillier public key, and Enc_{N_i}(k_i) */
 export interface SignRound1Payload {
   sessionId: string;
   fromNodeId: string;
   partyIndex: number;
   /** Compressed hex EC point: gamma_i * G */
   gammaCommitment: string;
-  /** MtA (multiplicative-to-additive) ciphertext for k_i * x_j product */
-  mtaCiphertext: string;
+  /** Paillier public modulus N_i (hex bigint) */
+  paillierN: string;
+  /** Paillier encryption of k_i under N_i (hex bigint) */
+  kiEnc: string;
+  /** Compressed hex EC point: k_i * G — enables partial-sig verification in Round 4 */
+  kiCommitment: string;
+  /** Schnorr proof-of-knowledge of gamma_i s.t. gamma_i*G = gammaCommitment */
+  gammaProof: { R: string; s: string };
+  /** Schnorr proof-of-knowledge of k_i s.t. k_i*G = kiCommitment */
+  kiProof: { R: string; s: string };
 }
 
-/** GG20 Round 2: MtA responses, delta_i */
+/** GG20 Round 2: per-peer P2P Paillier MtA ciphertexts */
 export interface SignRound2Payload {
   sessionId: string;
   fromNodeId: string;
+  toNodeId: string;
   partyIndex: number;
-  /** MtA response ciphertext */
+  /** JSON: { deltaEnc: hex, sigmaEnc: hex } — MtA ciphertexts for the recipient to decrypt */
   mtaResponse: string;
-  /** delta_i = k_i*gamma_i + alpha_ij + beta_ji (hex scalar) */
+  /** Unused in new protocol (kept for type compatibility) */
   deltaShare: string;
 }
 
-/** GG20 Round 3: partial signature */
+/** GG20 Round 3: delta_i share only (sigma_i is kept secret — used internally in Round 4) */
 export interface SignRound3Payload {
   sessionId: string;
   fromNodeId: string;
   partyIndex: number;
-  /** s_i partial signature scalar (hex) */
+  /** delta_i = party i's share of K * Gamma (hex scalar) */
+  deltaShare: string;
+}
+
+/** GG20 Round 4: partial signature s_i = k_i*m + r*sigma_i, plus sigma_i*G for verification */
+export interface SignRound4Payload {
+  sessionId: string;
+  fromNodeId: string;
+  partyIndex: number;
+  /** Partial signature s_i (hex scalar) */
   partialSig: string;
-  /** R_i = k_i * G (compressed hex point) */
-  RShare: string;
+  /** Compressed hex EC point: sigma_i * G (Delta_i) — used to verify s_i without revealing sigma_i */
+  sigmaCommitment: string;
 }
 
 export interface SignCompletePayload {

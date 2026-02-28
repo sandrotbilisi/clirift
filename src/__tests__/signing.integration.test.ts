@@ -3,16 +3,24 @@
  *
  * Wires two SigningCoordinator instances together in-memory with a mock
  * network (setImmediate delivery to simulate realistic async message arrival),
- * runs the complete GG20 3-round protocol, and asserts both sides emit
+ * runs the complete GG20 4-round protocol, and asserts both sides emit
  * 'complete' with a properly-formatted EIP-1559 signed transaction.
  *
- * This test specifically catches the async race conditions that were fixed:
- *   - Round 1 dropped because session didn't exist yet during onAccept's key load
- *   - Round 3 "not complete" because peer's Round 3 arrived during startRound3's key load
+ * The 4-round protocol:
+ *   Round 1 (broadcast): gamma_i*G, k_i*G, Paillier pubkey N_i, Enc_{N_i}(k_i), Schnorr proofs
+ *   Round 2 (P2P):       Paillier MtA ciphertexts for delta and sigma
+ *   Round 3 (broadcast): delta_i share only (sigma_i kept secret)
+ *   Round 4 (broadcast): partial signature s_i + sigma_i*G for verification
+ *
+ * Security: no party ever learns the other's raw nonce k_j, preventing
+ * the private key extraction attack present in the old RSA-based MtA.
+ *
+ * Key shares: valid 2-of-3 Shamir shares of private_key=1 for parties 1 and 2.
+ *   Lagrange reconstruction: L_1=2, L_2=-1, so 2*x_1 - x_2 = private_key.
+ *   With x_1=x_2=1: 2*1 - 1 = 1 ✓   pkMaster = 1*G = secp256k1 generator point.
  */
 
 import { describe, it, expect } from 'vitest';
-import { generateKeyPairSync } from 'crypto';
 import { SigningCoordinator } from '../core/signing/SigningCoordinator';
 import { MessageType } from '../network/protocol/Message';
 import type { NodeServer } from '../core/NodeServer';
@@ -25,14 +33,16 @@ import type { KeyShareStore, KeyShareData } from '../storage/KeyShareStore';
  * broadcast() → setImmediate-delivers to all registered peer coordinators.
  * sendTo()    → setImmediate-delivers to the target peer coordinator.
  * Using setImmediate instead of direct calls mimics the real async nature
- * of WebSocket message delivery so the race conditions are observable.
+ * of WebSocket message delivery so race conditions are observable.
  */
 class MockNodeServer {
   private coord!: SigningCoordinator;
   private peers = new Map<string, MockNodeServer>();
+  private nodeId!: string;
 
-  attach(c: SigningCoordinator) {
+  attach(c: SigningCoordinator, nodeId: string) {
     this.coord = c;
+    this.nodeId = nodeId;
   }
 
   addPeer(nodeId: string, peer: MockNodeServer) {
@@ -41,27 +51,21 @@ class MockNodeServer {
 
   broadcast<T>(type: MessageType, payload: T): void {
     for (const peer of this.peers.values()) {
-      setImmediate(() => void peer.coord.handleMessage(null, { type, payload }));
+      const senderId = this.nodeId;
+      setImmediate(() => void peer.coord.handleMessage(senderId, { type, payload }));
     }
   }
 
   sendTo<T>(targetNodeId: string, type: MessageType, payload: T): boolean {
     const peer = this.peers.get(targetNodeId);
     if (!peer) return false;
-    setImmediate(() => void peer.coord.handleMessage(null, { type, payload }));
+    const senderId = this.nodeId;
+    setImmediate(() => void peer.coord.handleMessage(senderId, { type, payload }));
     return true;
   }
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
-
-function makeRSAKeyPair() {
-  return generateKeyPairSync('rsa', {
-    modulusLength: 2048,
-    publicKeyEncoding: { type: 'spki', format: 'pem' },
-    privateKeyEncoding: { type: 'pkcs8', format: 'pem' },
-  });
-}
 
 function makeKeyShareStore(data: KeyShareData): KeyShareStore {
   return {
@@ -72,13 +76,13 @@ function makeKeyShareStore(data: KeyShareData): KeyShareStore {
   } as unknown as KeyShareStore;
 }
 
-// Arbitrary 32-byte secp256k1 scalars used as secret shares.
-// These won't produce a cryptographically-valid ECDSA signature against a
-// real private key (the simplified GG20 doesn't do proper Lagrange weighting),
-// but they exercise every line of coordinator + round logic.
-const SECRET_SHARE_1 = '1111111111111111111111111111111111111111111111111111111111111111';
-const SECRET_SHARE_2 = '2222222222222222222222222222222222222222222222222222222222222222';
-// Compressed secp256k1 generator point — used as a valid placeholder for publicKeyShares / pkMaster
+// Valid 2-of-3 Shamir shares of private_key=1 for parties with partyIndices 1 and 2.
+// Lagrange coefficients for subset {1,2}: L_1=2, L_2=-1 (mod curve_order).
+// Check: 2*1 + (-1)*1 = 1 = private_key ✓
+// These are valid shares of the polynomial f(x)=1 (constant), with f(1)=f(2)=1.
+const SECRET_SHARE_1 = '0000000000000000000000000000000000000000000000000000000000000001';
+const SECRET_SHARE_2 = '0000000000000000000000000000000000000000000000000000000000000001';
+// The secp256k1 generator point G = 1*G = pkMaster for private_key=1
 const G_POINT = '0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798';
 
 const RAW_TX = {
@@ -92,19 +96,14 @@ const RAW_TX = {
   chainId: 56,
 };
 
-// A real EIP-1559 keccak256 signing hash (32 bytes, no 0x prefix)
-const TX_HASH = '76a1ad7e039d1dc76f96159507010ca2913722083c122fdd81a56ebbd256ba14';
+// keccak256 of the EIP-1559 signing payload for RAW_TX (no 0x prefix)
+const TX_HASH = '0bf0c4b47c36fa5173ea107f90f33092ef676de96332fed4f08cb308d2eaf839';
 const DERIVATION_PATH = "m/44'/60'/0'/0/5";
 
 // ─── Tests ────────────────────────────────────────────────────────────────────
 
 describe('SigningCoordinator — 2-of-3 threshold signing', () => {
-  it('completes all 3 rounds and emits a signed EIP-1559 transaction', async () => {
-    // RSA key pairs: each node uses its own private key to decrypt MtA ciphertexts,
-    // and the peer's public key to encrypt them.
-    const rsaA = makeRSAKeyPair();
-    const rsaB = makeRSAKeyPair();
-
+  it('completes all 4 rounds and emits a signed EIP-1559 transaction', async () => {
     const nodeIdA = 'node-a'; // initiator
     const nodeIdB = 'node-b'; // participant
 
@@ -133,29 +132,25 @@ describe('SigningCoordinator — 2-of-3 threshold signing', () => {
       nodeId: nodeIdA,
       nodeServer: serverA as unknown as NodeServer,
       keyShareStore: makeKeyShareStore(shareA),
-      myPrivateKeyPem: rsaA.privateKey,
-      timeoutMs: 15_000,
+      myPrivateKeyPem: '',  // no longer used in signing
+      timeoutMs: 30_000,
     });
 
     const coordB = new SigningCoordinator({
       nodeId: nodeIdB,
       nodeServer: serverB as unknown as NodeServer,
       keyShareStore: makeKeyShareStore(shareB),
-      myPrivateKeyPem: rsaB.privateKey,
-      timeoutMs: 15_000,
+      myPrivateKeyPem: '',  // no longer used in signing
+      timeoutMs: 30_000,
     });
 
     // Wire coordinators to their mock servers
-    serverA.attach(coordA);
-    serverB.attach(coordB);
+    serverA.attach(coordA, nodeIdA);
+    serverB.attach(coordB, nodeIdB);
 
     // A → B routing, B → A routing
     serverA.addPeer(nodeIdB, serverB);
     serverB.addPeer(nodeIdA, serverA);
-
-    // Give each coordinator the peer's RSA public key for MtA encryption
-    coordA.setPeerPubkey(nodeIdB, rsaB.publicKey);
-    coordB.setPeerPubkey(nodeIdA, rsaA.publicKey);
 
     // Capture complete/abort from both sides
     const waitForComplete = (coord: SigningCoordinator, label: string) =>
@@ -177,5 +172,5 @@ describe('SigningCoordinator — 2-of-3 threshold signing', () => {
     expect(txHexA).toMatch(/^0x02/); // EIP-1559 type-2 prefix
     expect(txHexB).toMatch(/^0x02/);
     expect(txHexA).toBe(txHexB);     // Both nodes assembled identical signatures
-  }, 20_000); // 20-second timeout (RSA key generation is slow)
+  }, 60_000); // 60-second timeout: Paillier key generation (1024-bit) takes ~100-500ms per key
 });
