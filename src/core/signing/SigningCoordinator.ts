@@ -1,6 +1,7 @@
 import { EventEmitter } from 'events';
 import { v4 as uuidv4 } from 'uuid';
-import { serializeTransaction } from 'viem';
+import { keccak256, serializeTransaction } from 'viem';
+import { secp256k1 as nobleSecp } from '@noble/curves/secp256k1';
 import { computeChildKeyTweak } from '../../wallet/HdWallet';
 import {
   SigningSessionState,
@@ -21,8 +22,13 @@ import {
   executeSignRound3,
   recordRound3 as recordSignRound3,
   isSignRound3Complete,
-  assembleSignature,
 } from './rounds/SignRound3';
+import {
+  executeSignRound4,
+  recordRound4 as recordSignRound4,
+  isSignRound4Complete,
+  assembleSignature,
+} from './rounds/SignRound4';
 import {
   MessageType,
   SignRequestPayload,
@@ -30,19 +36,21 @@ import {
   SignRound1Payload,
   SignRound2Payload,
   SignRound3Payload,
+  SignRound4Payload,
   SignCompletePayload,
   RawTxData,
 } from '../../network/protocol/Message';
 import { NodeServer } from '../NodeServer';
 import { KeyShareStore } from '../../storage/KeyShareStore';
-import { CURVE_ORDER } from '../../crypto/secp256k1';
+import { CURVE_ORDER, hexToScalar, hexToPoint, scalarMulG } from '../../crypto/secp256k1';
+import { SigningError } from '../../utils/errors';
 import logger from '../../utils/logger';
 
 export interface SigningCoordinatorOptions {
   nodeId: string;
   nodeServer: NodeServer;
   keyShareStore: KeyShareStore;
-  myPrivateKeyPem: string;
+  myPrivateKeyPem: string;   // kept for API compatibility; no longer used in signing
   timeoutMs: number;
 }
 
@@ -62,18 +70,22 @@ export declare interface SigningCoordinator {
 export class SigningCoordinator extends EventEmitter {
   private session: SigningSessionState | null = null;
   private acceptedSigners: Map<string, SignAcceptPayload> = new Map();
-  private peerPubkeys: Map<string, string> = new Map();
-  private opts: SigningCoordinatorOptions;
-  private timeoutHandle: NodeJS.Timeout | null = null;
   private pendingRawTx: RawTxData | null = null;
   private pendingTxHash: string | null = null;
   private pendingDerivationPath: string | null = null;
   /** Cached key share from initiate() so onAccept creates the session without an async gap */
   private initiatorKeyShare: Awaited<ReturnType<KeyShareStore['load']>> | null = null;
-  /** Cached x_i scalar — set on both initiator and participant paths so startRound3 has no async gap */
+  /** Cached tweaked secret share — set on both initiator and participant paths */
   private cachedSecretShare: bigint | null = null;
   /** Prevents async race where two duplicate messages both pass the `if (!this.session)` guard */
   private sessionPending = false;
+  /** r value computed in Round 4, stored for use in finalize() */
+  private cachedR: string | null = null;
+  /** Guard against double 'complete' emission — both parties call finalize() independently */
+  private alreadyFinalized = false;
+  private timeoutHandle: NodeJS.Timeout | null = null;
+
+  private opts: SigningCoordinatorOptions;
 
   constructor(opts: SigningCoordinatorOptions) {
     super();
@@ -116,16 +128,19 @@ export class SigningCoordinator extends EventEmitter {
           await this.onAccept(fromNodeId!, msg.payload as SignAcceptPayload);
           break;
         case MessageType.SIGN_ROUND1:
-          await this.onRound1(fromNodeId!, msg.payload as SignRound1Payload);
+          await this.onRound1(fromNodeId, msg.payload as SignRound1Payload);
           break;
         case MessageType.SIGN_ROUND2:
-          await this.onRound2(fromNodeId!, msg.payload as SignRound2Payload);
+          await this.onRound2(fromNodeId, msg.payload as SignRound2Payload);
           break;
         case MessageType.SIGN_ROUND3:
-          await this.onRound3(fromNodeId!, msg.payload as SignRound3Payload);
+          await this.onRound3(fromNodeId, msg.payload as SignRound3Payload);
+          break;
+        case MessageType.SIGN_ROUND4:
+          await this.onRound4(fromNodeId, msg.payload as SignRound4Payload);
           break;
         case MessageType.SIGN_COMPLETE:
-          this.onComplete(msg.payload as SignCompletePayload);
+          await this.onComplete(msg.payload as SignCompletePayload);
           break;
         case MessageType.SIGN_ABORT:
           this.abort((msg.payload as { reason: string }).reason);
@@ -140,6 +155,28 @@ export class SigningCoordinator extends EventEmitter {
 
   private async onRequest(payload: SignRequestPayload): Promise<void> {
     if (this.session || this.sessionPending) return;
+
+    // Reject stale requests
+    if (Date.now() >= payload.deadline) {
+      logger.warn(`[SigningCoordinator] Ignoring sign request ${payload.sessionId}: deadline already passed`);
+      return;
+    }
+
+    // Independently verify the signing hash matches the raw transaction.
+    // A compromised initiator could send txHash != keccak256(rawTx) to trick
+    // participants into co-signing a different transaction than what was presented.
+    let expectedHash: string;
+    try {
+      expectedHash = computeSigningHash(payload.rawTx);
+    } catch (e) {
+      logger.error(`[SigningCoordinator] Could not compute signing hash from rawTx — ignoring request: ${e}`);
+      return;
+    }
+    if (expectedHash !== payload.txHash) {
+      logger.error(`[SigningCoordinator] txHash mismatch in sign request ${payload.sessionId}: expected ${expectedHash}, got ${payload.txHash}`);
+      return;
+    }
+
     this.sessionPending = true;
 
     try {
@@ -147,8 +184,6 @@ export class SigningCoordinator extends EventEmitter {
 
       const keyShare = await this.opts.keyShareStore.load();
       const partyIndex = keyShare.partyIndex;
-      // Apply BIP32 child key tweak: child_share = x_i + IL_0 + IL_index (mod n)
-      // This makes the threshold signature verify against the derived address, not pkMaster.
       const addrIndex = parseAddressIndex(payload.derivationPath);
       const tweak = computeChildKeyTweak(keyShare.pkMaster, keyShare.chainCode, addrIndex);
       this.cachedSecretShare = (hexToScalar(keyShare.secretShare) + tweak) % CURVE_ORDER;
@@ -162,7 +197,6 @@ export class SigningCoordinator extends EventEmitter {
       this.opts.nodeServer.sendTo(payload.initiatorNodeId, MessageType.SIGN_ACCEPT, accept);
       logger.info(`[SigningCoordinator] Accepted signing session ${payload.sessionId}`);
 
-      // Build signers list: [initiator, me] — enough for a 2-of-3 threshold
       const initiatorSigner: SignerInfo = {
         nodeId: payload.initiatorNodeId,
         partyIndex: payload.initiatorPartyIndex,
@@ -179,6 +213,9 @@ export class SigningCoordinator extends EventEmitter {
         this.opts.nodeId
       );
 
+      // Start participant timeout
+      this.startTimeout(payload.sessionId);
+
       // Start Round 1 immediately as a participant
       await this.startRound1();
     } finally {
@@ -190,11 +227,8 @@ export class SigningCoordinator extends EventEmitter {
     this.acceptedSigners.set(fromNodeId, payload);
     logger.info(`[SigningCoordinator] ${fromNodeId} accepted signing (party ${payload.partyIndex}). Total: ${this.acceptedSigners.size}`);
 
-    // Start signing once we have at least threshold-1 acceptances
     if (this.acceptedSigners.size >= 1 && !this.session && !this.sessionPending) {
       this.sessionPending = true;
-      // Use keyshare cached in initiate() — avoids an async gap where incoming
-      // Round 1 messages would arrive while session is still null and get dropped.
       const keyShare = this.initiatorKeyShare!;
       const addrIndex = parseAddressIndex(this.pendingDerivationPath ?? '');
       const tweak = computeChildKeyTweak(keyShare.pkMaster, keyShare.chainCode, addrIndex);
@@ -218,46 +252,88 @@ export class SigningCoordinator extends EventEmitter {
         this.opts.nodeId
       );
 
-      await this.startRound1(keyShare);
+      await this.startRound1();
       this.sessionPending = false;
     }
   }
 
-  private async startRound1(_keyShare?: Awaited<ReturnType<KeyShareStore['load']>>): Promise<void> {
+  private async startRound1(): Promise<void> {
     if (!this.session) return;
-    const { updatedState, broadcast } = executeSignRound1(this.session, this.peerPubkeys);
-    this.session = updatedState;
+    const { updatedState, broadcast } = await executeSignRound1(this.session);
+    // Paillier key generation is async. During the await, onRound1 may have fired and
+    // updated this.session with peers' Paillier keys / round1Received entries.
+    // Merge only our newly-generated fields into the CURRENT session to avoid
+    // overwriting any concurrent state updates.
+    if (!this.session) return; // aborted during key gen
+    this.session = {
+      ...this.session,
+      myKi: updatedState.myKi,
+      myGammaI: updatedState.myGammaI,
+      myGammaIPoint: updatedState.myGammaIPoint,
+      myPaillierN: updatedState.myPaillierN,
+      myPaillierLambda: updatedState.myPaillierLambda,
+      myPaillierMu: updatedState.myPaillierMu,
+      status: 'round1',
+    };
     this.opts.nodeServer.broadcast(MessageType.SIGN_ROUND1, broadcast);
     logger.info('[SigningCoordinator] Broadcast Sign Round 1');
-  }
-
-  private async onRound1(fromNodeId: string, payload: SignRound1Payload): Promise<void> {
-    if (!this.session || payload.sessionId !== this.session.sessionId) return;
-    // Ignore messages from nodes outside the signing subset — extra acceptors
-    // would corrupt the gamma-point sum and delta aggregation.
-    if (!this.session.signers.some((s) => s.nodeId === payload.fromNodeId)) return;
-    this.session = recordSignRound1(this.session, payload);
-    logger.info(`[SigningCoordinator] Round 1 from ${fromNodeId} (${this.session.round1Received.size}/${this.session.signers.length - 1})`);
-
+    // Peers may have sent their Round 1 messages while Paillier gen was running.
+    // Now that myKi is set, check if all Round 1 data is present to advance.
     if (isSignRound1Complete(this.session)) {
-      await this.startRound2();
+      this.startRound2();
     }
   }
 
-  private async startRound2(): Promise<void> {
-    if (!this.session || this.session.status !== 'round1') return;
-    this.session = { ...this.session, status: 'round2' }; // reserve before any await
-    const { updatedState, broadcast } = executeSignRound2(this.session, this.opts.myPrivateKeyPem);
-    this.session = updatedState;
-    this.opts.nodeServer.broadcast(MessageType.SIGN_ROUND2, broadcast);
-    logger.info('[SigningCoordinator] Broadcast Sign Round 2');
+  /** Throw if the current session has exceeded its deadline. */
+  private checkDeadline(): void {
+    if (this.session && Date.now() > this.session.deadline) {
+      throw new SigningError(`Session ${this.session.sessionId} deadline exceeded`);
+    }
   }
 
-  private async onRound2(fromNodeId: string, payload: SignRound2Payload): Promise<void> {
+  private async onRound1(fromNodeId: string | null, payload: SignRound1Payload): Promise<void> {
     if (!this.session || payload.sessionId !== this.session.sessionId) return;
     if (!this.session.signers.some((s) => s.nodeId === payload.fromNodeId)) return;
+    // Validate transport-layer sender matches self-reported fromNodeId
+    if (fromNodeId !== null && fromNodeId !== payload.fromNodeId) {
+      throw new SigningError(`Round 1 sender mismatch: transport says ${fromNodeId}, payload claims ${payload.fromNodeId}`);
+    }
+    this.checkDeadline();
+
+    this.session = recordSignRound1(this.session, payload);
+    logger.info(`[SigningCoordinator] Round 1 from ${payload.fromNodeId} (${this.session.round1Received.size}/${this.session.signers.length - 1})`);
+
+    if (isSignRound1Complete(this.session)) {
+      this.startRound2();
+    }
+  }
+
+  private startRound2(): void {
+    if (!this.session || this.session.status !== 'round1') return;
+    this.session = { ...this.session, status: 'round2' };
+
+    const x_i = this.cachedSecretShare!;
+    const { updatedState, perPeerPayloads } = executeSignRound2(this.session, x_i);
+    this.session = updatedState;
+
+    for (const [nodeId, payload] of perPeerPayloads) {
+      this.opts.nodeServer.sendTo(nodeId, MessageType.SIGN_ROUND2, payload);
+    }
+    logger.info('[SigningCoordinator] Sent Sign Round 2 (P2P MtA ciphertexts)');
+  }
+
+  private async onRound2(fromNodeId: string | null, payload: SignRound2Payload): Promise<void> {
+    if (!this.session || payload.sessionId !== this.session.sessionId) return;
+    // Only accept Round 2 messages addressed to us
+    if (payload.toNodeId !== this.opts.nodeId) return;
+    if (!this.session.signers.some((s) => s.nodeId === payload.fromNodeId)) return;
+    if (fromNodeId !== null && fromNodeId !== payload.fromNodeId) {
+      throw new SigningError(`Round 2 sender mismatch: transport says ${fromNodeId}, payload claims ${payload.fromNodeId}`);
+    }
+    this.checkDeadline();
+
     this.session = recordSignRound2(this.session, payload);
-    logger.info(`[SigningCoordinator] Round 2 from ${fromNodeId} (${this.session.round2Received.size}/${this.session.signers.length - 1})`);
+    logger.info(`[SigningCoordinator] Round 2 from ${payload.fromNodeId} (${this.session.round2Received.size}/${this.session.signers.length - 1})`);
 
     if (isSignRound2Complete(this.session)) {
       this.startRound3();
@@ -266,62 +342,117 @@ export class SigningCoordinator extends EventEmitter {
 
   private startRound3(): void {
     if (!this.session || this.session.status !== 'round2') return;
-    // Set status synchronously — no await below, so no window for
-    // an incoming Round 3 message to call finalize() before myPartialSig is set.
     this.session = { ...this.session, status: 'round3' };
-    const x_i = this.cachedSecretShare!;
 
-    const { updatedState, broadcast } = executeSignRound3(
-      this.session,
-      x_i,
-      this.session.txHash
-    );
+    const x_i = this.cachedSecretShare!;
+    const { updatedState, broadcast } = executeSignRound3(this.session, x_i);
     this.session = updatedState;
     this.opts.nodeServer.broadcast(MessageType.SIGN_ROUND3, broadcast);
-    logger.info('[SigningCoordinator] Broadcast Sign Round 3');
+    logger.info('[SigningCoordinator] Broadcast Sign Round 3 (delta+sigma shares)');
   }
 
-  private async onRound3(fromNodeId: string, payload: SignRound3Payload): Promise<void> {
+  private async onRound3(fromNodeId: string | null, payload: SignRound3Payload): Promise<void> {
     if (!this.session || payload.sessionId !== this.session.sessionId) return;
     if (!this.session.signers.some((s) => s.nodeId === payload.fromNodeId)) return;
+    if (fromNodeId !== null && fromNodeId !== payload.fromNodeId) {
+      throw new SigningError(`Round 3 sender mismatch: transport says ${fromNodeId}, payload claims ${payload.fromNodeId}`);
+    }
+    this.checkDeadline();
+
     this.session = recordSignRound3(this.session, payload);
-    logger.info(`[SigningCoordinator] Round 3 from ${fromNodeId} (${this.session.round3Received.size}/${this.session.signers.length - 1})`);
+    logger.info(`[SigningCoordinator] Round 3 from ${payload.fromNodeId} (${this.session.round3Received.size}/${this.session.signers.length - 1})`);
 
     if (isSignRound3Complete(this.session)) {
+      this.startRound4();
+    }
+  }
+
+  private startRound4(): void {
+    if (!this.session || this.session.status !== 'round3') return;
+    this.session = { ...this.session, status: 'round4' };
+
+    const { updatedState, broadcast, r } = executeSignRound4(this.session, this.session.txHash);
+    this.session = updatedState;
+    this.cachedR = r;
+    this.opts.nodeServer.broadcast(MessageType.SIGN_ROUND4, broadcast);
+    logger.info('[SigningCoordinator] Broadcast Sign Round 4 (partial signatures)');
+  }
+
+  private async onRound4(fromNodeId: string | null, payload: SignRound4Payload): Promise<void> {
+    if (!this.session || payload.sessionId !== this.session.sessionId) return;
+    if (!this.session.signers.some((s) => s.nodeId === payload.fromNodeId)) return;
+    if (fromNodeId !== null && fromNodeId !== payload.fromNodeId) {
+      throw new SigningError(`Round 4 sender mismatch: transport says ${fromNodeId}, payload claims ${payload.fromNodeId}`);
+    }
+    this.checkDeadline();
+
+    if (!this.cachedR) {
+      throw new SigningError('Received Round 4 message before our own Round 4 was computed');
+    }
+    this.session = recordSignRound4(this.session, payload, this.cachedR);
+    logger.info(`[SigningCoordinator] Round 4 from ${payload.fromNodeId} (${this.session.round4Received.size}/${this.session.signers.length - 1})`);
+
+    if (isSignRound4Complete(this.session)) {
       await this.finalize();
     }
   }
 
   private async finalize(): Promise<void> {
-    if (!this.session) return;
-    const sig = assembleSignature(this.session);
+    if (!this.session || !this.cachedR) return;
 
+    // Set immediately to prevent onComplete from double-emitting while we await below.
+    this.alreadyFinalized = true;
+
+    const sig = assembleSignature(this.session, this.cachedR);
     logger.info(`[SigningCoordinator] Signature assembled: r=${sig.r} s=${sig.s} v=${sig.v}`);
 
-    const rawTx = this.session.rawTx;
-    let signedTxHex: string;
-    if (rawTx?.to) {
-      signedTxHex = serializeTransaction(
-        {
-          type: 'eip1559',
-          chainId: rawTx.chainId,
-          nonce: rawTx.nonce,
-          maxFeePerGas: BigInt(rawTx.maxFeePerGas),
-          maxPriorityFeePerGas: BigInt(rawTx.maxPriorityFeePerGas),
-          gas: BigInt(rawTx.gasLimit),
-          to: rawTx.to as `0x${string}`,
-          value: BigInt(rawTx.value),
-          data: rawTx.data as `0x${string}`,
-        },
-        {
-          r: `0x${sig.r}` as `0x${string}`,
-          s: `0x${sig.s}` as `0x${string}`,
-          yParity: (sig.v - 27) as 0 | 1,
-        }
-      );
-    } else {
-      signedTxHex = `0x${sig.r}${sig.s}`;
+    // Verify signature against the derived child public key before broadcasting.
+    // An invalid signature means a protocol error or malicious peer — abort immediately.
+    try {
+      const keyShare = await this.opts.keyShareStore.load();
+      const addrIndex = parseAddressIndex(this.session.derivationPath);
+      const tweak = computeChildKeyTweak(keyShare.pkMaster, keyShare.chainCode, addrIndex);
+      const derivedPubKey = hexToPoint(keyShare.pkMaster).add(scalarMulG(tweak));
+      const msgBytes = Buffer.from(this.session.txHash, 'hex');
+      // @noble/curves d.ts types verify() as (Uint8Array, Uint8Array, Uint8Array).
+      // Pass the signature as compact r‖s (64 bytes) and pubkey as compressed bytes.
+      const sigBytes = Buffer.from(sig.r + sig.s, 'hex');
+      const valid = nobleSecp.verify(sigBytes, msgBytes, derivedPubKey.toRawBytes());
+      if (valid) {
+        logger.info('[SigningCoordinator] Signature verified against derived public key ✓');
+      } else {
+        this.abort('Signature verification failed — aborting to prevent broadcasting invalid signature');
+        return;
+      }
+    } catch (verifyErr) {
+      this.abort(`Signature verification threw: ${verifyErr instanceof Error ? verifyErr.message : String(verifyErr)}`);
+      return;
     }
+
+    const rawTx = this.session.rawTx;
+    if (!rawTx?.to) {
+      this.abort('Cannot serialize transaction: rawTx.to is missing');
+      return;
+    }
+
+    const signedTxHex = serializeTransaction(
+      {
+        type: 'eip1559',
+        chainId: rawTx.chainId,
+        nonce: rawTx.nonce,
+        maxFeePerGas: BigInt(rawTx.maxFeePerGas),
+        maxPriorityFeePerGas: BigInt(rawTx.maxPriorityFeePerGas),
+        gas: BigInt(rawTx.gasLimit),
+        to: rawTx.to as `0x${string}`,
+        value: BigInt(rawTx.value),
+        data: rawTx.data as `0x${string}`,
+      },
+      {
+        r: `0x${sig.r}` as `0x${string}`,
+        s: `0x${sig.s}` as `0x${string}`,
+        yParity: (sig.v - 27) as 0 | 1,
+      }
+    );
 
     const complete: SignCompletePayload = {
       sessionId: this.session.sessionId,
@@ -332,22 +463,45 @@ export class SigningCoordinator extends EventEmitter {
     this.opts.nodeServer.broadcast(MessageType.SIGN_COMPLETE, complete);
     this.clearTimeout();
     this.emit('complete', sig, signedTxHex);
+    // Release all sensitive session material after emitting
+    this.resetState();
   }
 
-  private onComplete(payload: SignCompletePayload): void {
+  private async onComplete(payload: SignCompletePayload): Promise<void> {
+    // Both parties independently call finalize() in this 4-round protocol, so
+    // onComplete is redundant for participants who already completed. Ignore it.
+    if (this.alreadyFinalized) return;
+    // Guard against stale or crafted SIGN_COMPLETE for a different/expired session.
+    if (!this.session || payload.sessionId !== this.session.sessionId) return;
     logger.info(`[SigningCoordinator] SIGN_COMPLETE received for session ${payload.sessionId}`);
     this.clearTimeout();
     this.emit('complete', payload.signature, payload.signedTxHex);
+    this.resetState();
   }
 
   private abort(reason: string): void {
     logger.error(`[SigningCoordinator] Signing aborted: ${reason}`);
     this.clearTimeout();
-    this.session = null;
+    this.resetState();
     this.emit('aborted', reason);
   }
 
+  /** Clear all session state and release sensitive material. Called on success and abort. */
+  private resetState(): void {
+    this.session = null;
+    this.acceptedSigners.clear();
+    this.pendingRawTx = null;
+    this.pendingTxHash = null;
+    this.pendingDerivationPath = null;
+    this.initiatorKeyShare = null;
+    this.cachedSecretShare = null;
+    this.cachedR = null;
+    this.sessionPending = false;
+    this.alreadyFinalized = false;
+  }
+
   private startTimeout(sessionId: string): void {
+    this.clearTimeout();
     this.timeoutHandle = setTimeout(() => {
       this.abort(`Signing session ${sessionId} timed out`);
     }, this.opts.timeoutMs);
@@ -360,19 +514,42 @@ export class SigningCoordinator extends EventEmitter {
     }
   }
 
-  setPeerPubkey(nodeId: string, pubkeyPem: string): void {
-    this.peerPubkeys.set(nodeId, pubkeyPem);
+  /** Store a peer's RSA public key (kept for API compatibility; no longer used in signing). */
+  setPeerPubkey(_nodeId: string, _pubkeyPem: string): void {
+    // RSA keys are no longer used; MtA is now Paillier-based with keys exchanged in Round 1.
   }
 }
 
 // Helpers
-function hexToScalar(hex: string): bigint {
-  return BigInt('0x' + hex.replace(/^0x/, ''));
-}
-
-/** Extract the final numeric index from a BIP44 path like "m/44'/60'/0'/0/5" → 5 */
 function parseAddressIndex(derivationPath: string): number {
   const parts = derivationPath.split('/');
   const last = parseInt(parts[parts.length - 1], 10);
-  return isNaN(last) ? 0 : last;
+  if (isNaN(last)) {
+    throw new SigningError(`Invalid derivation path — cannot parse address index: "${derivationPath}"`);
+  }
+  return last;
+}
+
+/**
+ * Compute the EIP-1559 signing hash for a raw transaction.
+ * Returns a 64-char lowercase hex string (no 0x prefix).
+ *
+ * Participants call this independently to verify that payload.txHash matches
+ * keccak256(rawTx), preventing a compromised initiator from tricking them into
+ * co-signing a different transaction than what was presented.
+ */
+export function computeSigningHash(rawTx: RawTxData): string {
+  if (!rawTx.to) throw new SigningError('rawTx.to is missing');
+  const unsigned = serializeTransaction({
+    type: 'eip1559',
+    chainId: rawTx.chainId,
+    nonce: rawTx.nonce,
+    maxFeePerGas: BigInt(rawTx.maxFeePerGas),
+    maxPriorityFeePerGas: BigInt(rawTx.maxPriorityFeePerGas),
+    gas: BigInt(rawTx.gasLimit),
+    to: rawTx.to as `0x${string}`,
+    value: BigInt(rawTx.value),
+    data: rawTx.data as `0x${string}`,
+  });
+  return keccak256(unsigned).slice(2); // strip 0x prefix
 }

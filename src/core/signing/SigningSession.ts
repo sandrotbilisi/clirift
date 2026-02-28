@@ -6,6 +6,7 @@ export type SigningStatus =
   | 'round1'
   | 'round2'
   | 'round3'
+  | 'round4'
   | 'complete'
   | 'aborted';
 
@@ -29,32 +30,48 @@ export interface SigningSessionState {
   signers: SignerInfo[];   // Which parties are participating (2-of-3 subset)
   mySignerIndex: number;   // My index within the signers list (1-indexed)
 
-  // Round 1 state (commitment phase)
+  // Round 1 state
   myKi?: bigint;           // k_i: signing nonce
   myGammaI?: bigint;       // gamma_i: auxiliary nonce
   myGammaIPoint?: string;  // gamma_i * G (compressed hex)
 
-  /** MtA (multiplicative-to-additive) ciphertext we sent to each signer */
-  mtaCiphertexts?: Map<string, string>; // nodeId → ciphertext (base64)
+  // Paillier keypair (generated fresh each session)
+  myPaillierN?: bigint;
+  myPaillierLambda?: bigint;
+  myPaillierMu?: bigint;
+
+  /** Peer Paillier public keys received in Round 1 */
+  peerPaillierN: Map<string, bigint>;   // nodeId → N_j
+  /** Peer encrypted k_j values received in Round 1 */
+  peerKiEnc: Map<string, bigint>;       // nodeId → Enc_{N_j}(k_j)
+  /** Peer k_i*G points received in Round 1 — used to verify partial sigs in Round 4 */
+  peerKiCommitment: Map<string, string>; // nodeId → k_i*G compressed hex
 
   /** Round 1 messages received from other signers */
-  round1Received: Map<string, { gammaCommitment: string; mtaCiphertext: string }>;
+  round1Received: Map<string, { gammaCommitment: string; paillierN: string; kiEnc: string; kiCommitment: string }>;
 
-  // Round 2 state (MtA responses)
-  myDeltaI?: bigint;       // delta_i = k_i * gamma_i + sum(alpha_ij)
-  /** Decrypted peer k_j values from Round 2 MtA — used in Round 3 to compute K = sum(k_i) */
-  peerKi?: Map<string, bigint>; // nodeId → peer's k_j scalar
-  /** Round 2 messages received */
-  round2Received: Map<string, { mtaResponse: string; deltaShare: string }>;
+  // Round 2 state — beta blinding terms kept by this party
+  /** -beta_delta per peer (our additive share of k_j * gamma_i) */
+  myBetaDelta: Map<string, bigint>;
+  /** -beta_sigma per peer (our additive share of k_j * L_i * x_i) */
+  myBetaSigma: Map<string, bigint>;
 
-  // Round 3 state (partial signatures)
-  R?: string;              // Signature nonce point (compressed hex)
-  r?: string;              // r = R.x mod n (hex scalar)
-  myPartialSig?: bigint;   // s_i
-  myRShare?: string;       // R_i = k_i * G (compressed hex)
+  /** Round 2 messages received (MtA ciphertexts addressed to us) */
+  round2Received: Map<string, { deltaEnc: string; sigmaEnc: string }>;
 
-  /** Round 3 messages received */
-  round3Received: Map<string, { partialSig: string; RShare: string }>;
+  // Round 3 state — delta and sigma shares
+  myDeltaI?: bigint;       // delta_i = k_i * gamma_i + sum of MtA contributions
+  mySigmaI?: bigint;       // sigma_i = k_i * L_i * x_i + sum of MtA contributions
+
+  /** Round 3 messages received (sigma_i is kept secret — only delta_i is shared) */
+  round3Received: Map<string, { deltaShare: string }>;
+
+  // Round 4 state — partial signatures
+  myPartialSig?: bigint;   // s_i = k_i * m + r * sigma_i
+  computedR?: string;       // r-value computed in Round 4, used by assembleSignature and recordRound4
+
+  /** Round 4 messages received */
+  round4Received: Map<string, { partialSig: string; sigmaCommitment: string }>;
 
   // Final
   signature?: { r: string; s: string; v: number };
@@ -70,6 +87,9 @@ export function createSigningSession(
   signers: SignerInfo[],
   myNodeId: string
 ): SigningSessionState {
+  if (signers.length !== 2) {
+    throw new Error(`Threshold signing requires exactly 2 signers, got ${signers.length}`);
+  }
   const mySignerIndex = signers.findIndex((s) => s.nodeId === myNodeId);
   if (mySignerIndex === -1) {
     throw new Error(`This node (${myNodeId}) is not in the signer list`);
@@ -84,9 +104,14 @@ export function createSigningSession(
     deadline,
     signers,
     mySignerIndex: mySignerIndex + 1,
+    peerPaillierN: new Map(),
+    peerKiEnc: new Map(),
+    peerKiCommitment: new Map(),
     round1Received: new Map(),
-    peerKi: new Map(),
+    myBetaDelta: new Map(),
+    myBetaSigma: new Map(),
     round2Received: new Map(),
     round3Received: new Map(),
+    round4Received: new Map(),
   };
 }
