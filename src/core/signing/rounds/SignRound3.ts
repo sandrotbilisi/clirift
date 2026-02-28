@@ -2,7 +2,6 @@ import {
   scalarMul,
   scalarInv,
   scalarToHex,
-  hexToScalar,
   CURVE_ORDER,
 } from '../../../crypto/secp256k1';
 import {
