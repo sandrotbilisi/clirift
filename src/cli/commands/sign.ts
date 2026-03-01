@@ -7,16 +7,19 @@ import { KeyShareStore } from '../../storage/KeyShareStore';
 import { loadOrCreateNodeIdentity } from '../../network/security/NodeIdentity';
 import { AddressIndex } from '../../wallet/AddressIndex';
 import { RawTxData } from '../../network/protocol/Message';
-import { keccak256, serializeTransaction } from 'viem';
+import { keccak256, serializeTransaction, encodeFunctionData, parseUnits, getAddress } from 'viem';
 
 export const signCommand = new Command('sign')
   .description('Initiate a 2-of-3 threshold signing session for an Ethereum transaction')
   .requiredOption('--to <address>', 'Recipient Ethereum address')
   .option('--value <eth>', 'ETH value to send (decimal, e.g. "1.5")', '0')
   .option('--data <hex>', 'Contract calldata (hex)', '0x')
+  .option('--token <address>', 'ERC-20 contract address — send tokens instead of ETH')
+  .option('--token-amount <amount>', 'Token amount to send (human-readable, e.g. "1.5")')
+  .option('--token-decimals <n>', 'Token decimals (default 18)', '18')
   .option('--index <n>', 'Derivation index of the signing address', '0')
   .option('--nonce <n>', 'Transaction nonce')
-  .option('--gas-limit <n>', 'Gas limit', '21000')
+  .option('--gas-limit <n>', 'Gas limit')
   .option('--max-fee <gwei>', 'maxFeePerGas in gwei', '20')
   .option('--max-priority-fee <gwei>', 'maxPriorityFeePerGas in gwei', '1')
   .option('--dry-run', 'Sign but do not broadcast; print raw transaction hex')
@@ -94,12 +97,48 @@ export const signCommand = new Command('sign')
       nonceSource = 'default';
     }
 
+    // ERC-20 token transfer: encode transfer(address,uint256) calldata
+    let txTo = options.to;
+    let txValue = (BigInt(Math.round(parseFloat(options.value) * 1e18))).toString();
+    let txData: string = options.data;
+    let defaultGasLimit = '21000';
+
+    if (options.token) {
+      if (!options.tokenAmount) {
+        console.error(chalk.red('--token-amount is required when --token is specified'));
+        process.exit(1);
+      }
+      const tokenContract = getAddress(options.token);
+      const recipient = getAddress(options.to);
+      const decimals = parseInt(options.tokenDecimals, 10);
+      const tokenAmountWei = parseUnits(options.tokenAmount as string, decimals);
+
+      txData = encodeFunctionData({
+        abi: [{
+          name: 'transfer',
+          type: 'function',
+          inputs: [
+            { name: 'recipient', type: 'address' },
+            { name: 'amount', type: 'uint256' },
+          ],
+          outputs: [{ name: '', type: 'bool' }],
+          stateMutability: 'nonpayable',
+        }],
+        functionName: 'transfer',
+        args: [recipient, tokenAmountWei],
+      });
+
+      txTo = tokenContract;   // send tx to the token contract
+      txValue = '0';          // no ETH transferred
+      defaultGasLimit = '65000'; // ERC-20 transfers need more gas than plain ETH
+    }
+
     const rawTx: RawTxData = {
-      to: options.to,
-      value: (BigInt(Math.round(parseFloat(options.value) * 1e18))).toString(),
-      data: options.data,
+      to: txTo,
+      value: txValue,
+      data: txData,
       nonce,
-      gasLimit: options.gasLimit,
+      gasLimit: options.gasLimit ?? defaultGasLimit,
       maxFeePerGas: gweiToWei(options.maxFee),
       maxPriorityFeePerGas: gweiToWei(options.maxPriorityFee),
       chainId: config.CLIRFT_CHAIN_ID,
@@ -124,9 +163,16 @@ export const signCommand = new Command('sign')
     console.log(chalk.cyan('\n  CLIRift Signing Session'));
     console.log(chalk.gray('  ─────────────────────────────────────────'));
     console.log(`  From     : ${chalk.green(signingEntry.address)} (index ${options.index})`);
-    console.log(`  To       : ${chalk.yellow(options.to)}`);
-    console.log(`  Value    : ${chalk.yellow(options.value)} ETH`);
+    if (options.token) {
+      console.log(`  To       : ${chalk.yellow(options.to)} (recipient)`);
+      console.log(`  Token    : ${chalk.yellow(getAddress(options.token))}`);
+      console.log(`  Amount   : ${chalk.yellow(options.tokenAmount)} (decimals: ${options.tokenDecimals})`);
+    } else {
+      console.log(`  To       : ${chalk.yellow(options.to)}`);
+      console.log(`  Value    : ${chalk.yellow(options.value)} ETH`);
+    }
     console.log(`  Nonce    : ${chalk.yellow(nonce)}${nonceSource === 'auto' ? chalk.gray(' (fetched from RPC)') : nonceSource === 'default' ? chalk.yellow(' (defaulted — no RPC)') : ''}`);
+    console.log(`  Gas      : ${chalk.yellow(rawTx.gasLimit)}`);
     console.log(`  Chain ID : ${chalk.yellow(config.CLIRFT_CHAIN_ID)}`);
     console.log(`  Tx Hash  : ${chalk.gray(txHash)}`);
     console.log(chalk.gray('  ─────────────────────────────────────────\n'));
